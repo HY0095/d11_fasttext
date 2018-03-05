@@ -15,13 +15,51 @@ sc = SparkContext.getOrCreate()
 hc = HiveContext(sc)
 
 
+
+#==================================================
+#    
+# Step 1.  Uitls Functions 
+#    
+#==================================================
+
+def timestamp_datetime(value):
+    value = time.localtime(int(value))
+    dt = time.strftime("%Y-%m-%d %H:%M:%S", value)
+    return dt
+
+
+def datetime_timestamp(dt):
+    time.strptime(dt, "%Y-%m-%d %H:%M:%S")
+    stamp = time.mktime(time.strptime(dt, "%Y-%m-%d %H:%M:%S"))
+    return int(stamp)
+
+
+def get_days(t1, t2):
+    # Both t1 and t2 format as "2012-03-23 07:34:44"
+    t1 = time.strptime(t1, "%Y-%m-%d %H:%M:%S")
+    t2 = time.strptime(t2, "%Y-%m-%d %H:%M:%S")
+    y, m, d, H, M, S = t1[0: 6]
+    datetime_1 = datetime.datetime(y, m, d, H, M, S)
+    y, m, d, H, M, S = t2[0: 6]
+    datetime_2 = datetime.datetime(y, m, d, H, M, S)
+    day_diff = (datetime_1 - datetime_2).days
+    return int(day_diff)
+
+
+#=================================================
+#
+# Step 2. UDF Functions
+#
+#=================================================
+
+
 def udf_entity_extract(id, id_value, apply_dt, e_type='accountmobile'):
     es = {}
     if id_value is None or id is None: return '%s:' % id
     if len(apply_dt) == 10: apply_dt = '%s 00:00:00' % apply_dt
     for x in id_value:
-        event_time = utils.timestamp_datetime(x.get('eventoccurtime'))
-        date_diff = utils.get_day(apply_dt, event_time)
+        event_time = timestamp_datetime(x.get('eventoccurtime'))
+        date_diff = get_days(apply_dt, event_time)
         if (event_time > apply_dt) and (date_diff <= 720):
             continue
         contact_mob = set([str(a) for a in eval(x.get('contact_mobile', '[]')) if len(a) > 0 and a.isdigit()])
@@ -88,7 +126,7 @@ def udf_entity_hash(id, id_value, apply_dt, dbg=False):
     return '%s_%s_%s' % (id, apply_dt, ''.join([str(x) for x in e_cnts]))
 
 
-def group_hash(args, hc):
+def udf_group_hash(args, hc):
     # group id_hash of mobile
     ids_hash_sql = '''
         select
@@ -128,24 +166,67 @@ def group_hash(args, hc):
     hc.sql(mobs_hash_sql).registerTempTable('mobs_hash')
 
 
+#======================================================
+#
+# Step 3. Drop, Create and Insert tables
+#
+#======================================================    
+
+
+def create_table(raw_tb, target_tb, hc):
+    # drop table
+    drop_table = '''drop table if exists creditmodel.%s ''' % target_tb
+    
+    # create table
+    create_table = '''
+        create table creditmodel.%s (
+                uid string
+               ,date string)
+    ''' % traget_tb
+    
+    # insert table
+    insert_table = '''
+        insert overwrite table creditmodel.%s
+        select
+            uid
+           ,date
+        from %s 
+    ''' % (target_tb, raw_tb)
+    
+    # execute sql 
+    hc.sql(drop_table)
+    hc.sql(create_table)
+    hc.sql(insert_table)
+    
+
+#=======================================================
+#
+# Step 4. Main Functions
+#
+#=======================================================
+    
+
 def main_calc_id_mob_hash(args, hc):
     # calc id_hash
-    calc_id_hash_sql = '''
+    sql = '''
         select
             A.value id, A.apply_dt, udf_entity_hash(A.value, B.id_value, A.apply_dt) id_hash
-        from %s_%s A
+        from %s A
         left outer join tmp_id_tb B on A.value = B.id
-    ''' % (args.target_tb_prefix, args.source)
-    hc.sql(calc_id_hash).registerTempTable('id_hash_tb')
+    ''' % (args.source)
+    hc.sql(sql).registerTempTable('id_hash_tb')
 
     # calc mob_hash
-    calc_mob_hash_sql = '''
+    sql = '''
         select
             A.mobile, A.apply_dt, udf_entity_hash(A.mobile, B.mobile_value, A.apply_dt) mob_hash
-        from %s_%s A
+        from %s A
         left outer join tmp_mob_tb B on A.mobile = B.mobile
-    ''' % (args.target_tb_prefix, args.source)
-    hc.sql(calc_mob_hash_sql).registerTempTable('mob_hash_tb')
+    ''' % (args.source)
+    hc.sql(sql).registerTempTable('mob_hash_tb')
+    
+    # group hash for id and mobile
+    udf_group_hash(args, hc)
 
 
 def main_offline_extract_data(args, hc, id_event_table, mob_event_table):
@@ -160,20 +241,20 @@ def main_offline_extract_data(args, hc, id_event_table, mob_event_table):
                 from (
                     select 
                         udf_entity_extract(B.id, B.id_value, A.apply_dt, 'accountmobile') id_mob
-                    from %s_%s A
+                    from %s A
                     left outer join %s B on A.value = B.id
                     )C
                 )D
-        union all
-            select 
-                value id
-               ,mobile
-            from %s_%s
+----        union all
+----            select 
+----                value id
+----               ,mobile
+----            from %s
 
-    ''' % ('fl_target', args.source, id_event_table, 'fl_target', args.source)
+    ''' % (args.source, id_event_table, args.source)
     print sql
     hc.sql(sql).registerTempTable('tmp_id_mob_tb')
-    print hc.sql('select count(*) from tmp_id_mob_tb').take(1)
+    print hc.sql('select * from tmp_id_mob_tb limit 10').show(5)
     
     sql = '''
         select 
@@ -181,7 +262,7 @@ def main_offline_extract_data(args, hc, id_event_table, mob_event_table):
         from (
                 select
                     distinct id
-                from fl_id_mob_%s
+                from tmp_id_mob_tb
                 ) A
         left outer join %s B on A.id = B.id
     ''' % (args.source, id_event_table)
@@ -195,7 +276,7 @@ def main_offline_extract_data(args, hc, id_event_table, mob_event_table):
         from (
                 select
                     distinct mobile
-                from fl_id_mob_%s
+                from tmp_id_mob_tb
                 ) A
         left outer join %s B on A.mobile = B.mobile
     ''' % (args.source, mobile_event_table)
@@ -208,14 +289,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('-task', default='Test_id', help='project name')
     parser.add_argument('-flag_4_test', default=1, help='project name')
-    parser.add_argument('-target_tb_prefix', default='fl_traget_test', help='project name')
+    parser.add_argument('-target_tb_prefix', default='base_table', help='project name')
     parser.add_argument('-test_tb', default='creditmodel.fasttext_score_dzn')
     args = parser.parse_args()
-    args.source = 'test' if args.task == 'Test_id' else 'td'
-    sql = '''
-        select value, mobile, test_date as apply_dt from %s
-    ''' % args.test_tb
-    hc.sql(sql).registerTempTable('fl_target_test')
+    args.source = 'base_table' if args.task == 'Test_id' else 'td'
+    sql = ' select value, mobile, test_date as apply_dt from %s ' % args.test_tb
+    hc.sql(sql).registerTempTable(args.source)
     hc.registerFunction('udf_entity_extract', udf_entity_extract)
     id_event_table = 'bigdata.idnumber_aggregation_events'
     mob_event_table = 'bigdata.mobile_aggregation_events'
